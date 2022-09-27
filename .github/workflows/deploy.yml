@@ -1,0 +1,85 @@
+name: Build and deploy
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DEV_AWS_ACCESS_KEY_ID: ${{ secrets.DEV_AWS_ACCESS_KEY_ID }}
+  DEV_AWS_SECRET_ACCESS_KEY: ${{ secrets.DEV_AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  build-docker-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Set branch name
+        run: echo "BRANCH=${GITHUB_REF##*/}" >> $GITHUB_ENV
+      - name: Set branch environments
+        run: |-
+          if [[ "${{github.base_ref}}" == "dev" || "${{github.ref}}" == "refs/heads/dev" ]]; then
+             echo "ECS_SERVICE=yd-dev-service" >> "$GITHUB_ENV"
+             echo "ECS_CLUSTER=yd-dev-cluster" >> "$GITHUB_ENV"
+             echo "ECS_TASK=yourdaily-dev-task" >> "$GITHUB_ENV"
+             echo "CONTAINER_NAME=yd-dev-docker" >> "$GITHUB_ENV"
+             echo "AWS_KEY=$DEV_AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+             echo "AWS_SECRET=$DEV_AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          fi
+          if [[ "${{github.base_ref}}" == "main" || "${{github.ref}}" == "refs/heads/main" ]]; then
+             echo "ECS_SERVICE=yd-prod-service" >> "$GITHUB_ENV"
+             echo "ECS_CLUSTER=yd-prod-cluster" >> "$GITHUB_ENV"
+             echo "ECS_TASK=yd-prod-task" >> "$GITHUB_ENV"
+             echo "CONTAINER_NAME=yd-prod-docker" >> "$GITHUB_ENV"
+             echo "AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+             echo "AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          fi
+      - name: checkout repo
+        uses: actions/checkout@v2
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ env.AWS_KEY }}
+          aws-secret-access-key: ${{ env.AWS_SECRET }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: build tag and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.CONTAINER_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      - name: download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition $ECS_TASK --query taskDefinition > task-definition.json
+      - name: fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+      - name: deploy Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
